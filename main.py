@@ -47,11 +47,11 @@ def main():
         state_size=state_size,
         action_size=action_size,
         device=device,
-        lr=0.0005,
-        gamma=0.99,
+        lr=0.001,
+        gamma=0.98,
         epsilon=1.0,
         epsilon_min=0.01,
-        epsilon_decay=0.995,
+        epsilon_decay=0.99,
         batch_size=32,
         target_update=10
     )
@@ -79,5 +79,5 @@ def main():
     validate_agent(val_env, agent)
 
 if __name__ == "__main__":
-    main() 
+    main()
 # %%
