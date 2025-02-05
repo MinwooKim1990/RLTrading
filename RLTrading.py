@@ -21,40 +21,26 @@ print("Using device:", device)
 ########################################
 # 1. Data Collection and Preprocessing (90% Train, 10% Validation)
 ########################################
-# 티커 목록: 20개 종목 (기존 19개에 "GOOGL" 추가)
 tickers = [
     "AAPL", "DLB", "DIS", "MSFT", "META", "BRK-A", "AVGO", "AMZN", "IONQ", "NVDA",
     "OKLO", "LUNR", "JPM", "CAKE", "KO", "TSLA", "TTWO", "HON", "ARM", "GOOGL"
 ]
 
-# Download adjusted close prices for the past 6 months
 data = yf.download(tickers, period="6mo", interval="1d")["Adj Close"]
 data = data.sort_index().dropna()
-
-# Split data: 90% for training, 10% for validation
 split_idx = int(len(data) * 0.9)
 train_data = data.iloc[:split_idx].reset_index(drop=True)
 val_data   = data.iloc[split_idx:].reset_index(drop=True)
 
 ########################################
-# 2. Improved Stock Trading Environment with Quant Features, Trade Limit & Enhanced Logging
+# 2. Improved Stock Trading Environment
 ########################################
 class ImprovedStockTradingEnv:
     def __init__(self, price_data, tickers, initial_capital=10000, transaction_cost=0.01, window=5, 
-                 risk_penalty=0, trade_penalty=1, validation_mode=False, prediction_penalty=50,
                  max_trades_per_day=10, cash_fraction=0.1):
         """
-        price_data: DataFrame with each column representing a stock (order corresponds to tickers)
-        tickers: list of tickers corresponding to the columns in price_data
-        initial_capital: total starting capital
-        transaction_cost: cost per trade (e.g., 0.01 means 1% fee)
-        window: lookback window for computing technical indicators
-        risk_penalty: (여기서는 제거하여, 기본 보상은 자산 변화로 결정)
-        trade_penalty: penalty per trade to discourage overtrading
-        validation_mode: if True, extra penalty based on BS prediction error is applied
-        prediction_penalty: weight for BS prediction error penalty during validation
-        max_trades_per_day: maximum number of trades allowed per day
-        cash_fraction: fraction of capital to keep as cash initially (here 0.1 → 1,000달러 현금, 9,000달러 투자)
+        - initial_capital: total dollars available.
+        - cash_fraction: fraction held as cash initially.
         """
         self.price_data = price_data.copy().reset_index(drop=True)
         self.num_days = len(self.price_data)
@@ -63,36 +49,31 @@ class ImprovedStockTradingEnv:
         self.initial_capital = initial_capital
         self.transaction_cost = transaction_cost
         self.window = window
-        self.risk_penalty = risk_penalty
-        self.trade_penalty = trade_penalty
-        self.validation_mode = validation_mode
-        self.prediction_penalty = prediction_penalty
         self.max_trades_per_day = max_trades_per_day
         self.cash_fraction = cash_fraction
         
-        # Portfolio: index 0 = cash; indices 1..num_stocks = dollar value invested in each stock.
+        # Portfolio: index 0 = cash, indices 1..num_stocks = number of shares held.
         self.num_assets = self.num_stocks + 1
         self.initial_prices = self.price_data.iloc[0].values  
         self.actions = self._create_action_mapping()
         self.action_space = list(self.actions.keys())
         self.action_size = len(self.actions)
-        self.portfolio_history = []   # daily portfolio values
-        self.transaction_log = []     # global transaction log (list of dicts)
-        self.max_portfolio_value = initial_capital
-        self.last_bs_ratio = None
-        self.trades_today = []        # daily trades log (reset each day)
+        # For plotting and logging.
+        self.daily_history = []   # End Day portfolio values.
+        self.error_bars = []      # Error bars per day.
+        self.transaction_log = [] # Global trade log.
+        self.trades_today = []    # Trades executed in current day.
+        self.daily_values = []    # Intermediate portfolio values for current day.
         self.reset()
         
     def _create_action_mapping(self):
-        actions = {0: "end_day"}  # Action 0 means "End Day"
+        actions = {0: "end_day"}
         action_id = 1
         fractions = [0.25, 0.5, 0.75, 1.0]
-        # Actions: from cash (index 0) to stock (indices 1..num_stocks)
         for stock in range(1, self.num_assets):
             for frac in fractions:
                 actions[action_id] = (0, stock, frac)
                 action_id += 1
-        # Actions: from stock to cash
         for stock in range(1, self.num_assets):
             for frac in fractions:
                 actions[action_id] = (stock, 0, frac)
@@ -102,42 +83,46 @@ class ImprovedStockTradingEnv:
     def reset(self):
         self.current_day = 0
         self.portfolio = np.zeros(self.num_assets)
-        # 초기 배분: cash_fraction는 현금, 나머지는 각 종목에 균등 투자
         self.portfolio[0] = self.initial_capital * self.cash_fraction
-        stock_capital = self.initial_capital * (1 - self.cash_fraction) / self.num_stocks
+        stock_money = self.initial_capital * (1 - self.cash_fraction)
         for i in range(1, self.num_assets):
-            self.portfolio[i] = stock_capital
-        self.portfolio_history = [self.get_total_value(self.current_day)]
+            self.portfolio[i] = stock_money / self.num_stocks / self.initial_prices[i - 1]
+        initial_value = self.get_total_value()
+        self.daily_history = [initial_value]
+        self.error_bars = [0.0]
         self.transaction_log = []
+        self.daily_values = [initial_value]
         self.trades_today = []
-        self.max_portfolio_value = self.get_total_value(self.current_day)
+        # 추가: 일 시작시 baseline 값 설정 (현금, 각 주식 보유량, 시작 가격)
+        self.baseline_cash = self.portfolio[0]
+        self.baseline_shares = self.portfolio[1:].copy()  # 각 주식의 baseline 보유 수량
+        self.day_start_prices = self.price_data.iloc[self.current_day].values.copy()
         state = self._get_state()
         return state
 
     def _get_state(self):
-        total_value = self.get_total_value(self.current_day)
-        portfolio_frac = self.portfolio / total_value
-        
         if self.current_day < self.num_days:
             current_prices = self.price_data.iloc[self.current_day].values
         else:
             current_prices = self.price_data.iloc[-1].values
+        stock_values = np.array([self.portfolio[i] * current_prices[i - 1] for i in range(1, self.num_assets)])
+        total_value = self.portfolio[0] + np.sum(stock_values)
+        portfolio_frac = np.concatenate(([self.portfolio[0] / total_value], stock_values / total_value))
         price_ratio = current_prices / self.initial_prices
         
+        # Technical features: moving averages, volatilities, Black-Scholes ratios, average returns.
         ma_ratios = []
         volatilities = []
         bs_ratios = []
         avg_returns = []
         T_const = 30 / 365
         r = 0.01
-        
         for i in range(self.num_stocks):
             start_idx = max(0, self.current_day - self.window + 1)
             window_prices = self.price_data.iloc[start_idx:self.current_day+1, i].values
             ma = np.mean(window_prices)
             ma_ratio = ma / self.initial_prices[i]
             ma_ratios.append(ma_ratio)
-            
             if len(window_prices) > 1:
                 log_returns = np.diff(np.log(window_prices))
                 vol_daily = np.std(log_returns)
@@ -148,7 +133,6 @@ class ImprovedStockTradingEnv:
                 avg_ret = 0.0
             volatilities.append(vol_annual)
             avg_returns.append(avg_ret)
-            
             S = current_prices[i]
             K = S
             if vol_annual > 0:
@@ -159,110 +143,36 @@ class ImprovedStockTradingEnv:
                 call_price = S
             bs_ratio = call_price / S
             bs_ratios.append(bs_ratio)
-        
-        self.last_bs_ratio = np.array(bs_ratios)
         technical_features = np.concatenate([price_ratio, np.array(ma_ratios),
                                                np.array(volatilities), np.array(bs_ratios),
                                                np.array(avg_returns)])
         state = np.concatenate([portfolio_frac, technical_features])
         return state
 
-    def get_total_value(self, day_index):
-        total = self.portfolio[0]
+    def get_total_value(self):
         if self.current_day < self.num_days:
             current_prices = self.price_data.iloc[self.current_day].values
         else:
             current_prices = self.price_data.iloc[-1].values
-        total += np.sum(self.portfolio[1:])
+        stock_values = np.array([self.portfolio[i] * current_prices[i - 1] for i in range(1, self.num_assets)])
+        total = self.portfolio[0] + np.sum(stock_values)
         return total
 
     def step(self, action):
-        """
-        - If action == 0 ("end_day"):  
-             * Compute bonus for all trades executed today based on next day's prices  
-             * Update portfolio value (reward = (new_value - old_value) + bonus_total)  
-             * Record summary (티커별 누적 매수/매도) in transaction log  
-             * Advance to next day  
-        - Else:  
-             * Execute trade (if 자산 잔액 충분하면) and record trade details (티커, 거래 유형, 거래 금액, 거래 가격)  
-             * Remain on same day to allow multiple trades  
-        """
-        current_prices = self.price_data.iloc[self.current_day].values  
-        value_before = self.get_total_value(self.current_day)
+        # 중간 포트폴리오 가치 기록 (에러바 계산용)
+        curr_val = self.get_total_value()
+        self.daily_values.append(curr_val)
         
-        # 하루 거래 횟수 제한: 이미 max_trades_per_day이면 강제로 End Day 처리
+        if self.current_day >= self.num_days:
+            return self._get_state(), 0, True, {'portfolio_value': curr_val}
+        
+        current_prices = self.price_data.iloc[self.current_day].values  
         if action != 0 and len(self.trades_today) >= self.max_trades_per_day:
             action = 0
-        
-        # End Day branch
-        if action == 0:
-            bonus_total = 0.0
-            buy_summary = {}   # {ticker: 누적 매수 금액}
-            sell_summary = {}  # {ticker: 누적 매도 금액}
-            if self.current_day + 1 < self.num_days:
-                next_prices = self.price_data.iloc[self.current_day + 1].values
-                for trade_info in self.trades_today:
-                    trade_type = trade_info['trade_type']
-                    ticker = trade_info['ticker']
-                    trade_price = trade_info['trade_price']
-                    transfer_amt = trade_info['transfer_amt']
-                    ticker_index = self.tickers.index(ticker)
-                    new_price = next_prices[ticker_index]
-                    if trade_type == "buy":
-                        bonus = (new_price / trade_price - 1) * transfer_amt
-                        buy_summary[ticker] = buy_summary.get(ticker, 0) + transfer_amt
-                    elif trade_type == "sell":
-                        bonus = (1 - new_price / trade_price) * transfer_amt
-                        sell_summary[ticker] = sell_summary.get(ticker, 0) + transfer_amt
-                    else:
-                        bonus = 0.0
-                    trade_info['bonus'] = bonus
-                    bonus_total += bonus
-            else:
-                bonus_total = 0.0
-                buy_summary = {}
-                sell_summary = {}
-            self.current_day += 1
-            if self.current_day >= self.num_days:
-                done = True
-                next_state = self._get_state()
-                final_value = self.get_total_value(self.num_days - 1)
-                reward = (final_value - value_before) + bonus_total
-                self.portfolio_history.append(final_value)
-                info = {'portfolio_value': final_value}
-                summary_info = {'day': self.current_day, 'buy_summary': str(buy_summary),
-                                'sell_summary': str(sell_summary), 'episode_summary': True}
-                self.transaction_log.append(summary_info)
-                self.trades_today = []
-                return next_state, reward, done, info
-            else:
-                next_prices = self.price_data.iloc[self.current_day].values
-                self.portfolio[1:] = self.portfolio[1:] * (next_prices / current_prices)
-                value_after = self.get_total_value(self.current_day)
-                reward = (value_after - value_before) + bonus_total  # Total asset change + bonus
-                self.portfolio_history.append(value_after)
-                done = False
-                info = {'portfolio_value': value_after}
-                summary_info = {'day': self.current_day, 'buy_summary': str(buy_summary),
-                                'sell_summary': str(sell_summary), 'episode_summary': True}
-                self.transaction_log.append(summary_info)
-                self.trades_today = []
-                return self._get_state(), reward, done, info
-        
-        # Trade action branch
-        else:
-            trade = self.actions[action]  # (src, dst, fraction)
+        # 같은 거래가 당일 3회 이상 발생한 경우, 강제로 end_day 처리 (기존 코드와 동일)
+        if action != 0:
+            trade = self.actions[action]
             src, dst, frac = trade
-            available = self.portfolio[src]
-            if available <= 0:
-                transfer_amt = 0.0
-            else:
-                transfer_amt = frac * available
-            # Execute trade only if transfer_amt > 0
-            if transfer_amt > 0:
-                self.portfolio[src] -= transfer_amt
-                self.portfolio[dst] += transfer_amt * (1 - self.transaction_cost)
-            # Determine trade type and ticker
             if src == 0:
                 trade_type = "buy"
                 ticker = self.tickers[dst - 1]
@@ -275,25 +185,136 @@ class ImprovedStockTradingEnv:
                 trade_type = "transfer"
                 ticker = "N/A"
                 trade_price = None
-            trade_info = {'day': self.current_day,
-                          'trade_type': trade_type,
-                          'ticker': ticker,
-                          'transfer_amt': transfer_amt,
-                          'trade_price': trade_price,
-                          'bonus': 0.0}
+            similar_count = sum(1 for t in self.trades_today if t.get('trade_type') == trade_type 
+                                and t.get('ticker') == ticker 
+                                and (t.get('trade_price') is not None and abs(t.get('trade_price') - trade_price) < 1e-3))
+            if similar_count >= 3:
+                action = 0
+
+        # End Day 분기 --------------------------------------------------------------------------------
+        if action == 0:
+            # 하루 시작시 기준포트폴리오(현금 및 보유 주식)의 총 가치 계산
+            prev_total_value = self.baseline_cash + np.sum(self.baseline_shares * self.day_start_prices)
+            
+            # 기존과 같이 하루 마감 시, 다음 날 가격을 반영하기 위해 current_day를 증가시킵니다.
+            self.current_day += 1
+            if self.current_day < self.num_days:
+                day_end_prices = self.price_data.iloc[self.current_day].values.copy()
+            else:
+                day_end_prices = self.price_data.iloc[-1].values.copy()
+            new_total_value = self.portfolio[0] + np.sum(self.portfolio[1:] * day_end_prices)
+            
+            # 전체 보상(전체 포트폴리오 가치 변화)
+            total_reward = new_total_value - prev_total_value
+            
+            # 개별 거래에 의한 보상 계산 (수수료 1% 반영)
+            trade_reward_total = 0.0
+            baseline_shares_updated = self.baseline_shares.copy()
+            for trade in self.trades_today:
+                ticker = trade.get('ticker')
+                i = self.tickers.index(ticker)  # 주식의 인덱스 (티커순)
+                if trade.get('trade_type') == 'buy':
+                    trade_price = trade.get('trade_price')
+                    shares = trade.get('shares')
+                    # 매수한 주식은 수수료 1%가 포함된 거래가격 기준으로 보상 계산
+                    trade_reward = (day_end_prices[i] - trade_price * (1 + self.transaction_cost)) * shares
+                    trade_reward_total += trade_reward
+                elif trade.get('trade_type') == 'sell':
+                    trade_price = trade.get('trade_price')
+                    shares = trade.get('shares')
+                    # 매도한 주식은 거래 후 수수료 반영된 금액과 당일 시작 가격과의 차이로 보상 계산
+                    trade_reward = (trade_price * (1 - self.transaction_cost) - self.day_start_prices[i]) * shares
+                    trade_reward_total += trade_reward
+                    baseline_shares_updated[i] = max(baseline_shares_updated[i] - shares, 0)
+            
+            # 거래가 없었던 주식에 대한 보유 보상: 당일 시작 가격과 종가의 차이
+            holdings_reward = 0.0
+            for i in range(len(baseline_shares_updated)):
+                holdings_reward += baseline_shares_updated[i] * (day_end_prices[i] - self.day_start_prices[i])
+            
+            # 현금에 대한 보상: 현금 잔고 차이
+            cash_reward = self.portfolio[0] - self.baseline_cash
+            
+            # 최종 보상은 개별 거래 보상 + 보유 보상 + 현금 보상
+            reward = trade_reward_total + holdings_reward + cash_reward
+            # (디버그 확인: total_reward와 reward는 같아야 합니다.)
+            # print(f"total_reward: {total_reward:.2f}, cash:{cash_reward:.2f}, holdings:{holdings_reward:.2f}, trades:{trade_reward_total:.2f}")
+            
+            if len(self.daily_values) > 1:
+                err = (max(self.daily_values) - min(self.daily_values)) / 2.0
+            else:
+                err = 0.0
+            self.daily_history.append(new_total_value)
+            self.error_bars.append(err)
+            
+            summary_info = {'day': self.current_day, 'buy_summary': str({}),
+                            'sell_summary': str({}), 'episode_summary': True}
+            self.transaction_log.append(summary_info)
+            self.trades_today = []
+            self.daily_values = []
+            
+            # 새로운 날 시작 시 baseline 업데이트 (현금, 주식, 일 시작 가격)
+            if self.current_day < self.num_days:
+                self.baseline_cash = self.portfolio[0]
+                self.baseline_shares = self.portfolio[1:].copy()
+                self.day_start_prices = day_end_prices.copy()
+            
+            return self._get_state(), reward, self.current_day >= self.num_days, {'portfolio_value': new_total_value}
+        
+        # Trade 액션 분기 (거래 실행) --------------------------------------------------------------------
+        else:
+            trade = self.actions[action]
+            src, dst, frac = trade
+            if src == 0:  # 매수
+                available_cash = self.portfolio[0]
+                total_trade_amount = frac * available_cash
+                effective_trade_amount = total_trade_amount / (1 + self.transaction_cost)
+                if effective_trade_amount < 0.1 * current_prices[dst - 1]:
+                    return self._get_state(), 0, False, {'portfolio_value': self.get_total_value()}
+                shares_bought = effective_trade_amount / current_prices[dst - 1]
+                self.portfolio[0] -= total_trade_amount  
+                self.portfolio[dst] += shares_bought
+                trade_type = "buy"
+                ticker = self.tickers[dst - 1]
+                trade_price = current_prices[dst - 1]
+                dollar_amt = total_trade_amount
+                trade_info = {'day': self.current_day,
+                              'trade_type': trade_type,
+                              'ticker': ticker,
+                              'dollar_amt': dollar_amt,
+                              'trade_price': trade_price,
+                              'shares': shares_bought}
+            elif dst == 0:  # 매도
+                available_shares = self.portfolio[src]
+                total_stock_value = available_shares * current_prices[src - 1]
+                transfer_amt = frac * total_stock_value
+                if transfer_amt < 0.1 * current_prices[src - 1]:
+                    return self._get_state(), 0, False, {'portfolio_value': self.get_total_value()}
+                shares_to_sell = transfer_amt / current_prices[src - 1]
+                self.portfolio[src] -= shares_to_sell
+                cash_received = transfer_amt * (1 - self.transaction_cost)
+                self.portfolio[0] += cash_received
+                trade_type = "sell"
+                ticker = self.tickers[src - 1]
+                trade_price = current_prices[src - 1]
+                dollar_amt = transfer_amt
+                trade_info = {'day': self.current_day,
+                              'trade_type': trade_type,
+                              'ticker': ticker,
+                              'dollar_amt': dollar_amt,
+                              'trade_price': trade_price,
+                              'shares': shares_to_sell}
+            else:
+                return self._get_state(), 0, False, {'portfolio_value': self.get_total_value()}
             self.trades_today.append(trade_info)
             self.transaction_log.append(trade_info)
-            reward = -self.trade_penalty  # Immediate cost for trading
-            current_value = self.get_total_value(self.current_day)
-            self.portfolio_history.append(current_value)
-            done = False
-            info = {'portfolio_value': current_value}
-            # Call replay() here for more frequent epsilon decay:
-            agent.replay()
-            return self._get_state(), reward, done, info
+            reward = 0  # 개별 거래 시 즉시 보상은 없으며, 후속 end_day에서 계산합니다.
+            new_val = self.get_total_value()
+            self.daily_values.append(new_val)
+            return self._get_state(), reward, False, {'portfolio_value': new_val}
 
 ########################################
-# 3. Improved Dueling Double DQN Agent with Dropout
+# 3. Dueling Double DQN Agent with Dropout and Randomness Scale
 ########################################
 class DuelingDQN(nn.Module):
     def __init__(self, input_dim, output_dim, dropout_rate=0.2):
@@ -325,7 +346,12 @@ class DuelingDQN(nn.Module):
 
 class DQNAgent:
     def __init__(self, state_size, action_size, device, lr=0.0005, gamma=0.99, epsilon=1.0,
-                 epsilon_min=0.01, epsilon_decay=0.995, batch_size=32, target_update=10):
+                 epsilon_min=0.01, epsilon_decay=0.995, batch_size=32, target_update=10, randomness_scale=1):
+        """
+        randomness_scale: 1 ~ 10, where 1 means ~10% randomness and 10 means 100% randomness.
+        effective_epsilon = epsilon * (randomness_scale / 10)
+        상태에 가우시안 노이즈를 추가하여 랜덤성을 부여합니다.
+        """
         self.state_size = state_size
         self.action_size = action_size
         self.device = device
@@ -337,6 +363,7 @@ class DQNAgent:
         self.batch_size = batch_size
         self.target_update = target_update
         self.learn_step_counter = 0
+        self.randomness_scale = randomness_scale
         
         self.model = DuelingDQN(state_size, action_size).to(device)
         self.target_model = DuelingDQN(state_size, action_size).to(device)
@@ -351,24 +378,32 @@ class DQNAgent:
         self.memory.append((state, action, reward, next_state, done))
     
     def act(self, state):
-        if np.random.rand() <= self.epsilon:
+        noise_std = 0.05 * (self.randomness_scale / 10.0)
+        noisy_state = state + np.random.normal(0, noise_std, size=state.shape)
+        
+        effective_epsilon = self.epsilon * (self.randomness_scale / 10.0)
+        if np.random.rand() <= effective_epsilon:
             return random.randrange(self.action_size)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            
+        state_tensor = torch.FloatTensor(noisy_state).unsqueeze(0).to(self.device)
         self.model.eval()
         with torch.no_grad():
             q_values = self.model(state_tensor)
+            q_noise = torch.normal(0, 0.1, size=q_values.shape).to(self.device)
+            q_values = q_values + q_noise * (self.randomness_scale / 10.0)
         self.model.train()
         return torch.argmax(q_values[0]).item()
-    
+        
     def replay(self):
         if len(self.memory) < self.batch_size:
             return
         minibatch = random.sample(self.memory, self.batch_size)
-        states = torch.FloatTensor([s for s,_,_,_,_ in minibatch]).to(self.device)
-        actions = torch.LongTensor([a for _,a,_,_,_ in minibatch]).unsqueeze(1).to(self.device)
-        rewards = torch.FloatTensor([r for _,_,r,_,_ in minibatch]).to(self.device)
-        next_states = torch.FloatTensor([ns for _,_,_,ns,_ in minibatch]).to(self.device)
-        dones = torch.FloatTensor([float(d) for _,_,_,_,d in minibatch]).to(self.device)
+        states, actions, rewards, next_states, dones = zip(*minibatch)
+        states = torch.FloatTensor(np.array(states)).to(self.device)
+        actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
         
         q_values = self.model(states).gather(1, actions).squeeze(1)
         next_actions = torch.argmax(self.model(next_states), dim=1, keepdim=True)
@@ -391,27 +426,29 @@ class DQNAgent:
             self.update_target_network()
 
 ########################################
-# 4. Main Training and Validation Loop with Per-Episode Saving
+# 4. Main Training and Validation Loop with Replay Call Limit
 ########################################
 weights_path = "dqn_weights.pth"
 train_log_csv = "training_trades.csv"
 val_log_csv = "validation_trades.csv"
+max_replay_calls_per_episode = 20  # 최대 replay 호출 횟수 per 에피소드
+replay_call_interval = 10         # 매 10 스텝마다 replay 호출
 
 if __name__ == "__main__":
-    # Create training environment (90% training data; validation_mode=False)
+    # Create training environment
     train_env = ImprovedStockTradingEnv(train_data, tickers, initial_capital=10000, transaction_cost=0.01, 
-                                          window=5, risk_penalty=0, trade_penalty=1,
-                                          validation_mode=False, max_trades_per_day=10, cash_fraction=0.1)
+                                          window=5, max_trades_per_day=10, cash_fraction=0.1)
     state_size = len(train_env._get_state())
     action_size = train_env.action_size
-    agent = DQNAgent(state_size, action_size, device)
+    # For training, randomness_scale = 3 (~30% randomness)
+    agent = DQNAgent(state_size, action_size, device, randomness_scale=3)
     
     if os.path.exists(weights_path):
-        agent.model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=False))
+        agent.model.load_state_dict(torch.load(weights_path, map_location=device))
         agent.target_model.load_state_dict(agent.model.state_dict())
         print("Loaded pre-trained weights.")
     
-    episodes = 100
+    episodes = 10  # For testing, set to 10 episodes
     episode_values = []
     training_trade_logs = []
     
@@ -421,31 +458,36 @@ if __name__ == "__main__":
     for e in range(episodes):
         state = train_env.reset()
         done = False
-        daily_values = [train_env.portfolio_history[0]]
         total_reward = 0
+        step_count = 0
+        replay_calls = 0
         
         while not done:
             action = agent.act(state)
             next_state, reward, done, info = train_env.step(action)
             agent.remember(state, action, reward, next_state, done)
-            # Call replay() every step for epsilon decay
-            agent.replay()
+            step_count += 1
+            if step_count % replay_call_interval == 0 and replay_calls < max_replay_calls_per_episode:
+                agent.replay()
+                replay_calls += 1
             state = next_state
             total_reward += reward
-            daily_values.append(info['portfolio_value'])
-        episode_values.append(daily_values[-1])
-        print(f"Training Episode {e+1}/{episodes} - Final Asset: ${daily_values[-1]:.2f}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.2f}")
+        # Use daily_history and error_bars for plotting.
+        day_values = train_env.daily_history  # one value per trading day
+        if len(day_values) != len(train_env.error_bars):
+            train_env.error_bars.append(0.0)
+        episode_values.append(day_values[-1])
+        print(f"Training Episode {e+1}/{episodes} - Final Asset: ${day_values[-1]:.2f}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.2f}")
         for tx in train_env.transaction_log:
             tx['episode'] = e+1
             training_trade_logs.append(tx)
         
-        # Save weights and log after each episode
         torch.save(agent.model.state_dict(), weights_path)
         pd.DataFrame(training_trade_logs).to_csv(train_log_csv, index=False)
         
         ax.clear()
-        ax.plot(daily_values, marker='o')
-        ax.set_title("Training: Daily Portfolio Value")
+        ax.errorbar(range(1, len(day_values)+1), day_values, yerr=train_env.error_bars, fmt='o-', capsize=4)
+        ax.set_title("Training: End Day Portfolio Value")
         ax.set_xlabel("Trading Day")
         ax.set_ylabel("Portfolio Value ($)")
         plt.pause(0.05)
@@ -454,11 +496,11 @@ if __name__ == "__main__":
     plt.show()
     print("Saved trained weights and training trade log.")
     
-    # Validation Phase (10% validation data; validation_mode=True)
+    # Validation Phase (no replay calls)
     print("\nValidation Phase:")
     val_env = ImprovedStockTradingEnv(val_data, tickers, initial_capital=10000, transaction_cost=0.01, window=5, 
-                                        risk_penalty=0, trade_penalty=1,
-                                        validation_mode=True, prediction_penalty=50, max_trades_per_day=10, cash_fraction=0.1)
+                                        max_trades_per_day=10, cash_fraction=0.1)
+    agent.randomness_scale = 7  # For validation, ~70% randomness
     val_episode_values = []
     validation_trade_logs = []
     val_episodes = 5
@@ -466,30 +508,27 @@ if __name__ == "__main__":
     for e in range(val_episodes):
         state = val_env.reset()
         done = False
-        daily_values = [val_env.portfolio_history[0]]
         total_reward = 0
         while not done:
             action = agent.act(state)
             next_state, reward, done, info = val_env.step(action)
-            agent.remember(state, action, reward, next_state, done)
             state = next_state
             total_reward += reward
-            daily_values.append(info['portfolio_value'])
-        val_episode_values.append(daily_values[-1])
-        print(f"Validation Episode {e+1} - Final Asset: ${daily_values[-1]:.2f}, Total Reward: {total_reward:.2f}")
+        day_values = val_env.daily_history
+        if len(day_values) != len(val_env.error_bars):
+            val_env.error_bars.append(0.0)
+        val_episode_values.append(day_values[-1])
+        print(f"Validation Episode {e+1} - Final Asset: ${day_values[-1]:.2f}, Total Reward: {total_reward:.2f}")
         for tx in val_env.transaction_log:
             tx['episode'] = e+1
             validation_trade_logs.append(tx)
         
         plt.figure(figsize=(8,4))
-        plt.plot(daily_values, marker='o')
-        plt.title(f"Validation Episode {e+1} - Daily Portfolio Value")
+        plt.errorbar(range(1, len(day_values)+1), day_values, yerr=val_env.error_bars, fmt='o-', capsize=4)
+        plt.title(f"Validation Episode {e+1} - End Day Portfolio Value")
         plt.xlabel("Trading Day")
         plt.ylabel("Portfolio Value ($)")
         plt.show()
     
     pd.DataFrame(validation_trade_logs).to_csv(val_log_csv, index=False)
     print(f"Validation trade log saved to {val_log_csv}")
-
-
-# %%
